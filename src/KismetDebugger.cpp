@@ -25,6 +25,7 @@
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include <imgui.h>
 #include <imgui_internal.h>
+#include <regex>
 #include <misc/cpp/imgui_stdlib.h>
 #include <glaze/glaze.hpp>
 
@@ -38,6 +39,7 @@ namespace RC::GUI::KismetDebugger
     volatile bool is_hooked = false; // cannot hook *immediately* as GNatives is populated at runtime
 
     volatile bool should_pause = false;
+    volatile bool disable_breakpoints = false;
     volatile bool should_next = false;
     std::optional<PausedContext> context;
     std::mutex context_mutex;
@@ -49,8 +51,10 @@ namespace RC::GUI::KismetDebugger
         static const EExprToken expr = static_cast<EExprToken>(N);
         UFunction* fn = Stack.Node();
         size_t index = Stack.Code() - fn->GetScript().GetData() - 1;
-        if (should_pause || g_breakpoints.has_breakpoint(fn, index))
+        if (should_pause || (g_breakpoints.has_breakpoint(fn, index) && !disable_breakpoints))
         {
+            if (!should_pause)
+                std::cout << "hit breakpoint" << std::endl;
             should_pause = true;
             std::unique_lock<std::mutex> lock_a(context_mutex);
             PausedContext ctx{
@@ -62,7 +66,7 @@ namespace RC::GUI::KismetDebugger
             lock_a.unlock();
             while (should_pause && !should_next)
             {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
             std::unique_lock<std::mutex> lock_b(context_mutex);
             context = std::nullopt;
@@ -115,39 +119,29 @@ namespace RC::GUI::KismetDebugger
     }
     auto BreakpointStore::has_breakpoint(UFunction* fn, size_t index) -> bool
     {
-        auto [it_fn, inserted] = m_breakpoints_by_function.emplace(fn, nullptr);
-        if (!inserted)
-        {
-            if (it_fn->second)
-                return it_fn->second->contains(index);
-        }
-        else
-        {
-            // insert null so we know we've already inserted the fn ptr into the name map
-            auto [it_name, inserted] = m_breakpoints_by_name.emplace(fn->GetFullName(), nullptr);
-            if (!inserted)
-            {
-                if (it_name->second)
-                {
-                    it_fn->second = it_name->second;
-                    return it_name->second->contains(index);
-                }
-            }
-        }
+        auto it_fn = m_breakpoints_by_function.find(fn);
+        if (it_fn != m_breakpoints_by_function.end() && it_fn->second && it_fn->second->contains(index))
+            return true;
+
+        auto it_name = m_breakpoints_by_name.find(fn->GetFullName());
+        if (it_name != m_breakpoints_by_name.end() && it_name->second && it_name->second->contains(index))
+            return true;
+
         return false;
     }
     auto BreakpointStore::add_breakpoint(UFunction* fn, size_t index) -> void
     {
-        std::shared_ptr<FunctionBreakpoints> bps;
         auto [it_fn, inserted_fn] = m_breakpoints_by_function.emplace(fn, nullptr);
         auto [it_name, inserted_name] = m_breakpoints_by_name.emplace(fn->GetFullName(), nullptr);
-        if (!inserted_fn && it_fn->second) bps = it_fn->second;
-        if (!inserted_name && it_name->second) bps = it_name->second;
 
-        if (!bps)
-            bps = it_fn->second = it_name->second = std::make_shared<FunctionBreakpoints>();
+        if (!it_fn->second)
+            it_fn->second = std::make_shared<FunctionBreakpoints>();
 
-        bps->emplace(index);
+        if (!it_name->second)
+            it_name->second = std::make_shared<FunctionBreakpoints>();
+
+        it_fn->second->emplace(index);
+        it_name->second->emplace(index);
 
         save();
 
@@ -191,27 +185,31 @@ namespace RC::GUI::KismetDebugger
     }
     auto BreakpointStore::add_breakpoint(const std::wstring& fn, size_t index) -> void
     {
-        std::shared_ptr<FunctionBreakpoints> bps;
         auto [it_name, inserted_name] = m_breakpoints_by_name.emplace(fn, nullptr);
-        if (!inserted_name && it_name->second) bps = it_name->second;
 
-        if (!bps)
-            bps = it_name->second = std::make_shared<FunctionBreakpoints>();
+        if (!it_name->second)
+            it_name->second = std::make_shared<FunctionBreakpoints>();
 
-        bps->emplace(index);
+        it_name->second->emplace(index);
 
         save();
     }
     auto BreakpointStore::remove_breakpoint(UFunction* fn, size_t index) -> void
     {
-        std::shared_ptr<FunctionBreakpoints> bps;
-        auto [it_fn, inserted_fn] = m_breakpoints_by_function.emplace(fn, nullptr);
-        auto [it_name, inserted_name] = m_breakpoints_by_name.emplace(fn->GetFullName(), nullptr);
-        if (!inserted_fn && it_fn->second) bps = it_fn->second;
-        if (!inserted_name && it_fn->second) bps = it_name->second;
+        auto it_fn = m_breakpoints_by_function.find(fn);
+        auto it_name = m_breakpoints_by_name.find(fn->GetFullName());
 
-        if (bps)
-            bps->erase(index);
+        if (it_fn != m_breakpoints_by_function.end() && it_fn->second)
+            it_fn->second->erase(index);
+        if (it_name != m_breakpoints_by_name.end() && it_name->second)
+            it_name->second->erase(index);
+        
+        save();
+    }
+    auto BreakpointStore::remove_all_breakpoints(UFunction* fn, size_t index) -> void
+    {
+        m_breakpoints_by_function.clear();
+        m_breakpoints_by_name.clear();
 
         save();
     }
@@ -230,6 +228,7 @@ namespace RC::GUI::KismetDebugger
             is_hooked = false;
             should_pause = false;
             should_next = false;
+            disable_breakpoints = false;
 
             // Give main thread some time to exit hooked function. This can
             // possibly be called to unload the DLL, in which case bad things
@@ -330,6 +329,7 @@ namespace RC::GUI::KismetDebugger
         is_hooked = false;
         should_pause = false;
         should_next = false;
+        disable_breakpoints = false;
     }
 
     auto get_object_address(FProperty* property, EExprToken expr, auto in_context) -> void*
@@ -422,13 +422,15 @@ namespace RC::GUI::KismetDebugger
         {
             if (auto ctx = context)
             {
-                if (ImGui::Button("continue"))
+                if (ImGui::Button("resume"))
                 {
+                    std::cout << "resume clicked" << std::endl;
                     should_pause = false;
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("next"))
+                if (ImGui::Button("step"))
                 {
+                    std::cout << "step clicked" << std::endl;
                     should_next = true;
                 }
 
@@ -461,7 +463,23 @@ namespace RC::GUI::KismetDebugger
             {
                 if (ImGui::Button("pause"))
                 {
+                    std::cout << "pause clicked" << std::endl;
                     should_pause = true;
+                }
+            }
+
+            if (!disable_breakpoints)
+            {
+                if (ImGui::Button("disable breakpoints"))
+                {
+                    disable_breakpoints = true;
+                }
+            }
+            else
+            {
+                if (ImGui::Button("enable breakpoints"))
+                {
+                    disable_breakpoints = false;
                 }
             }
         }
@@ -577,18 +595,31 @@ namespace RC::GUI::KismetDebugger
                 int n = 0;
                 std::wstring_convert<std::codecvt_utf8<wchar_t>> conv;
 
+                std::string regex_pattern;
+                for (char ch : m_nav_function) {
+                    if (ch == ' ') {
+                        // Replace spaces with ".*" to match any sequence of characters, including spaces
+                        regex_pattern += "(.*)";
+                    } else if (ch == '*') {
+                        // Replace asterisks with "[a-zA-Z0-9_]*" to match alphanumeric and underscore
+                        regex_pattern += "([a-zA-Z0-9_]*)";
+                    } else {
+                        // Escape special regex characters and add to the pattern
+                        if (ch == '.' || ch == '(' || ch == ')' || ch == '\\' || ch == '[' || ch == ']' || ch == '*' || ch == '+' || ch == '?' || ch == '{' || ch == '}' || ch == '^' || ch == '$' || ch == '|') {
+                            regex_pattern += '\\';
+                        }
+                        regex_pattern += ch;
+                    }
+                }
+                        
+                std::regex search_regex(regex_pattern, std::regex::icase);
+                        
                 UObjectGlobals::ForEachUObject([&](UObject* object, ...) {
                     if (object->IsA<UFunction>())
                     {
                         std::string full_name = conv.to_bytes(object->GetFullName());
 
-                        auto it = std::search(
-                            full_name.begin(), full_name.end(),
-                            m_nav_function.begin(), m_nav_function.end(),
-                            [](auto ch1, auto ch2) { return std::toupper(ch1) == std::toupper(ch2); }
-                        );
-
-                        if (it != full_name.end())
+                        if (std::regex_search(full_name, search_regex))
                         {
                             const char* name_c_str = full_name.c_str();
 
@@ -599,7 +630,7 @@ namespace RC::GUI::KismetDebugger
                                 m_nav_function = full_name;
                             }
 
-                            if (n++ > 10)
+                            if (n++ > 100)
                             {
                                 ImGui::Text("...");
                                 return LoopAction::Break;
@@ -924,7 +955,7 @@ namespace RC::GUI::KismetDebugger
 
         m_current_expr = static_cast<EExprToken>(read<uint8_t>());
 
-        //std::cout << "rendering (" << std::hex << unsigned(m_current_expr) << std::dec << ") @ " << (index - 1) << " " << expr_to_string(m_current_expr) << std::endl;
+        // std::cout << "rendering (" << std::hex << unsigned(m_current_expr) << std::dec << ") @ " << (index - 1) << " " << expr_to_string(m_current_expr) << std::endl;
 
 
         ImGui::SetCursorPosX(ImGui::GetCursorStartPos().x);
@@ -934,9 +965,15 @@ namespace RC::GUI::KismetDebugger
         if (ImGui::Selectable(label.c_str(), is_breakpoint, 0, {30, 0}))
         {
             if (is_breakpoint)
+            {
+                // std::cout << "remove_breakpoint" << std::endl;
                 m_breakpoints.remove_breakpoint(m_fn, expr_index);
+            }
             else
+            {
+                // std::cout << "add_breakpoint" << std::endl;
                 m_breakpoints.add_breakpoint(m_fn, expr_index);
+            }
         }
         ImGui::PopStyleVar();
         ImGui::SameLine();
@@ -1089,17 +1126,15 @@ namespace RC::GUI::KismetDebugger
             case EX_LocalVirtualFunction:
             case EX_VirtualFunction:
             {
-                //std::cout << "reading " << sizeof(FName) << " bytes @ " << index << std::endl;
-
                 /*
-                for (int i = 0; i < script_size; ++i)
-                    std::cout << script[i] << " ";
+                std::cout << "reading " << sizeof(FName) << " bytes @ " << m_index << std::endl;
+
+                for (int i = 0; i < m_script_size; ++i)
+                    std::cout << m_script[i] << " ";
                 std::cout << std::endl;
-                */
 
-                /*
-                for (int i = 0; i < script_size; ++i)
-                    std::cout << std::hex << std::setfill('0') << std::setw(2) << unsigned(script[i]) << " ";
+                for (int i = 0; i < m_script_size; ++i)
+                    std::cout << std::hex << std::setfill('0') << std::setw(2) << unsigned(m_script[i]) << " ";
                 std::cout << std::endl;
                 */
 
@@ -1378,7 +1413,7 @@ namespace RC::GUI::KismetDebugger
             {
                 // This should never occur.
                 //UE_LOG(LogScriptSerialization, Warning, TEXT("Error: Unknown bytecode 0x%02X; ignoring it"), (uint8)Expr );
-                std::cout << "unknown expr (" << unsigned(m_current_expr) << ") " << expr_to_string(m_current_expr) << std::endl;
+                // std::cout     << "unknown expr (" << unsigned(m_current_expr) << ") " << expr_to_string(m_current_expr) << std::endl;
                 ImGui::Text("unknown expr (%i) %s", unsigned(m_current_expr), expr_to_string(m_current_expr));
                 break;
             }

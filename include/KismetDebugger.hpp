@@ -38,6 +38,7 @@ namespace RC::GUI::KismetDebugger
         auto add_breakpoint(UFunction* fn, size_t index) -> void;
         auto add_breakpoint(const std::wstring& fn, size_t index) -> void;
         auto remove_breakpoint(UFunction* fn, size_t index) -> void;
+        auto remove_all_breakpoints(UFunction* fn, size_t index) -> void;
 
     private:
         std::optional<std::filesystem::path> m_save_path{};
